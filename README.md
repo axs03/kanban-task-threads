@@ -5,6 +5,11 @@ own**: the first post is a live status card rewritten in place, and the replies
 are the append-only log. The post body answers *"what is happening now?"*; the
 thread answers *"how did we get here?"*.
 
+The isolated multi-board extension can instead publish **only after first block**,
+with one central publisher reading several boards into a shared or separate
+forum. Existing configurations keep the original behavior. See
+[multi-board configuration, safety and migration](docs/multi-board.md).
+
 ![Discord forum with managed status tags, task posts, a live status card and
 actor-signed thread updates](docs/assets/catalog-screenshot-full.png)
 

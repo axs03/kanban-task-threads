@@ -17,11 +17,13 @@ Failures are reported in the run report, never swallowed.
 """
 
 import json
+import os
 import re
 import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .render import (
     COMMENTED_EXCERPT_TEMPLATE,
@@ -97,6 +99,15 @@ _TAG_REQUIRED_HINT = (
 )
 
 
+class LeaseLostError(RuntimeError):
+    """The fenced board lease was lost before a transport effect was sent.
+
+    Raised by the effect-ownership guard when the lease was already gone before
+    any HTTP request could be issued. It is a deterministic no-send condition —
+    distinct from a lost response, which is an unknown create outcome.
+    """
+
+
 class Consumer:
     """One pass over a board's task_events, publishing through a Transport.
 
@@ -123,7 +134,22 @@ class Consumer:
         reply_templates: dict | None = None,
         comment_excerpt_chars: int = 180,
         guild_id: str = "",
+        thread_creation: str = "all",
+        qualify_identity: bool = False,
+        require_binding: bool = False,
+        route_check=None,
+        forum_lock=None,
+        owns_store: bool = False,
     ):
+        if thread_creation not in ("all", "first_blocked"):
+            raise ValueError("invalid thread_creation mode")
+        self._thread_creation = thread_creation
+        self._qualify_identity = qualify_identity or thread_creation == "first_blocked"
+        self._require_binding = require_binding
+        self._route_check = route_check
+        self._lease_guard = None
+        self._forum_lock = forum_lock
+        self._owns_store = owns_store
         self._board_db_path = str(board_db_path)
         self._store = store
         self._transport = transport
@@ -155,28 +181,73 @@ class Consumer:
         self._fixed_now = now
         now = self._now()
         report = Report()
+        if self._route_check is not None:
+            self._route_check()
         lease = f"consume:{self._board}"
         token = self._store.acquire_lease(lease, self._holder, now=now, ttl=self._lease_ttl)
         if token is None:
             report.acquired = False
             return report
-        conn = sqlite3.connect(f"file:{self._board_db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = None
         try:
+            # Build the read-only URI from the canonical path: Path.as_uri()
+            # percent-encodes '?'/'#' so the URI cannot alias a decoy prefix
+            # (e.g. "<dir>?opaque/kanban.db" must not open "<dir>").
+            native_path = Path(self._board_db_path).resolve()
+            conn = sqlite3.connect(native_path.as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            # Bind the opened connection to the validated native inode: the
+            # read-only handle must be the same file the route preflight
+            # validated (sqlite3 exposes no fileno() on this interpreter).
+            opened = conn.execute("PRAGMA database_list").fetchone()[2]
+            expected = native_path.stat()
+            actual = os.stat(opened)
+            if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                conn.close()
+                raise RuntimeError("native board database identity mismatch")
+            if self._require_binding:
+                self._store.bind(
+                    self._board, self._destination, holder=self._holder, token=token, now=now
+                )
 
             def owns_lease():
                 # Fencing: prove ownership before every task's side effects. A
                 # holder that lost the lease must not race the new one.
+                if self._route_check is not None:
+                    self._route_check()
+                if self._require_binding:
+                    self._store.check_binding(self._board, self._destination)
                 return self._store.renew_lease(
                     lease, self._holder, token, now=self._now(), ttl=self._lease_ttl
                 )
+
+            self._lease_guard = owns_lease
+
+            if self._thread_creation == "first_blocked":
+                # Persist activation before any forum maintenance can fail or
+                # delay delivery. One native snapshot closes the unblock race.
+                conn.execute("BEGIN")
+                try:
+                    watermark = conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM task_events"
+                    ).fetchone()[0]
+                    blocked = [
+                        r[0] for r in conn.execute("SELECT id FROM tasks WHERE status = 'blocked'")
+                    ]
+                    self._activation = self._store.activate(self._board, watermark, blocked)
+                finally:
+                    conn.rollback()
 
             if CAP_TAGS in self._transport.capabilities() and not self._forum_prepared:
                 if not owns_lease():
                     report.warnings.append("lease lost before Discord forum setup")
                     return report
                 try:
-                    self._transport.prepare_forum()
+                    if self._forum_lock is None:
+                        self._transport.prepare_forum()
+                    else:
+                        with self._forum_lock():
+                            self._transport.prepare_forum()
                 except ForumTagSetupError as exc:
                     report.errors.append(f"Discord forum setup failed: {exc}")
                     return report
@@ -200,10 +271,13 @@ class Consumer:
             by_task: dict = {}
             for row in events:
                 by_task.setdefault(row["task_id"], []).append(row)
+            if self._thread_creation == "first_blocked":
+                for task_id in self._store.bootstrap_tasks(self._board):
+                    by_task.setdefault(task_id, [])
             aborted = False
 
-            if events:
-                batch_max = events[-1]["id"]
+            if by_task:
+                batch_max = events[-1]["id"] if events else cursor
                 floor = batch_max
                 for task_id, task_events in by_task.items():
                     if not owns_lease():
@@ -256,16 +330,36 @@ class Consumer:
                 else:
                     report.warnings.append("lease lost before Discord metadata audit")
         finally:
-            conn.close()
+            self._lease_guard = None
+            if conn is not None:
+                conn.close()
             self._store.release_lease(lease, self._holder, token)
         return report
 
     def _now(self) -> int:
         return int(self._fixed_now if self._fixed_now is not None else time.time())
 
+    def _assert_effect_ownership(self):
+        if self._lease_guard is None or not self._lease_guard():
+            raise LeaseLostError("board lease lost before transport operation")
+
+    def close(self):
+        """Runtime-owned single-board state closes after its in-flight pass ends.
+
+        Direct/injected stores retain their caller's ownership, as in upstream.
+        The multi-board coordinator owns and closes its own bundle stores.
+        """
+        if self._owns_store:
+            self._store._conn.close()
+            self._owns_store = False
+
+    def _thread_name(self, title: str, task_id: str) -> str:
+        identity = f"{self._board}:{task_id}" if self._qualify_identity else task_id
+        return render_thread_name(title, identity)
+
     def _position_of(self, task_id: str) -> int:
         post = self._store.get_post(self._board, task_id)
-        return post["last_event_id"] if post else 0
+        return post["last_event_id"] if post else self._store.scan_position(self._board, task_id)
 
     def _process_task(
         self, conn, task_id: str, events, batch_max: int, now: int, report: Report
@@ -274,6 +368,8 @@ class Consumer:
         needs nothing more from this batch, its durable position otherwise."""
         store, board = self._store, self._board
         post = store.get_post(board, task_id)
+        if post and post["thread_id"] is not None:
+            store.finish_bootstrap(board, task_id)
 
         if post and post["state"] in ("tombstone", "dead_letter"):
             return batch_max
@@ -302,19 +398,50 @@ class Consumer:
 
         task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if task_row is None:  # deleted under us: nothing to render
+            self._store.finish_bootstrap(board, task_id)
             return batch_max
+        if self._thread_creation == "first_blocked" and (not post or not post["thread_id"]):
+            pos = self._position_of(task_id)
+            eligible = [
+                r["id"]
+                for r in events
+                if r["kind"] == "blocked" and r["id"] > max(pos, self._activation)
+            ]
+            bootstrap = task_id in store.bootstrap_tasks(board)
+            if not eligible and not bootstrap:
+                store.checkpoint_scan(board, task_id, batch_max)
+                return batch_max
+            # Replies start at the first qualifying block, never at creation.
+            # A bootstrap obligation's snapshot block is already durable (its
+            # position is at or below the activation watermark); anchor there
+            # so a later reblock in the retry window cannot skip intervening
+            # unblock/comment updates. Non-bootstrap cards anchor at the first
+            # block in this window (pre-block events stay suppressed).
+            start = self._activation if bootstrap else min(eligible) - 1
+            store.checkpoint_scan(board, task_id, max(pos, start))
         view = self._view_for(conn, task_id, task_row, now)
         card = render_card(view, template=self._card_template)
 
         # -- ensure the post exists ------------------------------------------
         opened = False
         if post is None or post["thread_id"] is None:
-            thread_name = render_thread_name(task_row["title"] or "", task_id)
+            thread_name = self._thread_name(task_row["title"] or "", task_id)
             store.begin_create(board, task_id, now=now)
+            if self._thread_creation == "first_blocked":
+                store.set_task_position(
+                    board, task_id, last_event_id=store.scan_position(board, task_id)
+                )
             try:
                 ref = self._transport.open_thread(title=thread_name, card=card)
             except TransportError as err:
                 return self._create_failed_known(task_id, err, now, report, batch_max)
+            except LeaseLostError:
+                # A deterministic, no-send ownership refusal: nothing reached
+                # Discord. Clear the pending marker and retry from the
+                # pre-create position next pass — never quarantine it.
+                store.clear_pending(board, task_id)
+                report.warnings.append(f"{task_id}: create not sent (lease lost); will retry")
+                return self._position_of(task_id)
             except Exception as exc:
                 # Response lost: unknown outcome, recorded, never blindly retried.
                 report.errors.append(f"{task_id}: create outcome unknown: {exc!r}")
@@ -327,6 +454,7 @@ class Consumer:
                 destination=self._destination,
             )
             store.set_thread_state(board, task_id, name=thread_name)
+            store.finish_bootstrap(board, task_id)
             report.opened.append(task_id)
             self._announce_to_dependents(conn, task_id, task_row, ref, report)
             opened = True
@@ -518,7 +646,7 @@ class Consumer:
                     self._record_tag_readback(task_id, "", result)
                     post = store.get_post(board, task_id)
             if CAP_TITLE_STATE in caps:
-                name = render_thread_name(view["title"], task_id)
+                name = self._thread_name(view["title"], task_id)
                 # A NULL last_name is a legacy row (thread created before names
                 # carried the id): the live name is unknown, so PATCH it once
                 # rather than recording an assumption that can never self-correct.

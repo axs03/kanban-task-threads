@@ -434,6 +434,22 @@ def _manifest_version() -> str:
 _USER_AGENT = f"kanban-task-threads/{_manifest_version()} (Hermes plugin)"
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects for authenticated requests.
+
+    urllib's default redirect handler replays every request header — including
+    `Authorization: Bot ...` — to the `Location` target, which can be another
+    origin or a plaintext downgrade. Returning None surfaces the 3xx to the
+    caller as a non-2xx transport error instead of leaking the credential.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_RejectRedirects())
+
+
 def urllib_http(
     method: str, url: str, body: dict | None, timeout: float = 10.0, headers: dict | None = None
 ) -> tuple[int, dict]:
@@ -445,8 +461,16 @@ def urllib_http(
     if headers:
         all_headers.update(headers)
     request = urllib.request.Request(url, data=data, method=method, headers=all_headers)
+    authenticated = any(key.lower() == "authorization" for key in all_headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        if authenticated:
+            # A bot credential must never follow a redirect: the Location
+            # target is not this route, and the default handler would replay
+            # Authorization to it. The no-redirect opener returns the 3xx.
+            response = _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+        else:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        with response as resp:
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as err:

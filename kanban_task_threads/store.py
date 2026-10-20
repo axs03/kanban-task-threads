@@ -48,7 +48,24 @@ CREATE TABLE IF NOT EXISTS leases (
     expires_at INTEGER NOT NULL,
     token INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS activation (
+    board TEXT PRIMARY KEY, watermark INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS board_binding (
+    board TEXT PRIMARY KEY, destination TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bootstrap (
+    board TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(board, task_id)
+);
+CREATE TABLE IF NOT EXISTS scans (
+    board TEXT NOT NULL, task_id TEXT NOT NULL, last_event_id INTEGER NOT NULL,
+    PRIMARY KEY(board, task_id)
+);
 """
+
+
+class BindingError(RuntimeError):
+    """State ownership/destination is uncertain; explicit reconciliation required."""
 
 
 class StateStore:
@@ -106,6 +123,95 @@ class StateStore:
                     raise
 
     # --- cursor ---------------------------------------------------------------
+
+    def check_binding(self, board: str, destination: str, *, adopting=False) -> None:
+        for table in ("posts", "cursor", "activation", "bootstrap", "scans", "board_binding"):
+            if self._conn.execute(
+                f"SELECT 1 FROM {table} WHERE board != ? LIMIT 1", (board,)
+            ).fetchone():
+                raise BindingError("foreign-board state; reconciliation required")
+        if self._conn.execute(
+            "SELECT 1 FROM leases WHERE name != ? LIMIT 1", (f"consume:{board}",)
+        ).fetchone():
+            raise BindingError("foreign-board lease state; reconciliation required")
+        binding = self._conn.execute(
+            "SELECT destination FROM board_binding WHERE board = ?", (board,)
+        ).fetchone()
+        if binding and binding[0] != destination:
+            raise BindingError("destination binding changed; board frozen")
+        if not binding and not adopting:
+            raise BindingError("board destination is not bound")
+        for row in self._conn.execute(
+            "SELECT thread_id, destination, pending_create_at FROM posts WHERE board = ?", (board,)
+        ):
+            if row["destination"] and row["destination"] != destination:
+                raise BindingError("recorded post destination conflicts; board frozen")
+            if not row["destination"] and (row["thread_id"] is not None or not binding):
+                raise BindingError("legacy post destination unknown; reconcile before adoption")
+
+    def bind(self, board: str, destination: str, *, holder: str, token: int, now: int) -> None:
+        """Additive adoption, atomically under the exact fenced board lease."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._conn.execute(
+                "SELECT 1 FROM leases WHERE name = ? AND holder = ? "
+                "AND token = ? AND expires_at > ?",
+                (f"consume:{board}", holder, token, now),
+            ).fetchone():
+                raise BindingError("lease lost before state binding")
+            self.check_binding(board, destination, adopting=True)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO board_binding VALUES (?, ?)", (board, destination)
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def activate(self, board: str, watermark: int, blocked: list[str]) -> int:
+        """Persist a snapshot boundary and obligations together; never reset history."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT watermark FROM activation WHERE board = ?", (board,)
+            ).fetchone()
+            if row is None:
+                self._conn.execute("INSERT INTO activation VALUES (?, ?)", (board, watermark))
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO bootstrap VALUES (?, ?)",
+                    [(board, task_id) for task_id in blocked],
+                )
+            self._conn.execute("COMMIT")
+            return row[0] if row else watermark
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def bootstrap_tasks(self, board: str) -> list[str]:
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT task_id FROM bootstrap WHERE board = ? ORDER BY task_id", (board,)
+            )
+        ]
+
+    def finish_bootstrap(self, board: str, task_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM bootstrap WHERE board = ? AND task_id = ?", (board, task_id)
+        )
+
+    def scan_position(self, board: str, task_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT last_event_id FROM scans WHERE board = ? AND task_id = ?", (board, task_id)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def checkpoint_scan(self, board: str, task_id: str, position: int) -> None:
+        self._conn.execute(
+            "INSERT INTO scans VALUES (?, ?, ?) ON CONFLICT(board, task_id) DO UPDATE "
+            "SET last_event_id = MAX(last_event_id, excluded.last_event_id)",
+            (board, task_id, position),
+        )
 
     def get_cursor(self, board: str) -> int:
         row = self._conn.execute(

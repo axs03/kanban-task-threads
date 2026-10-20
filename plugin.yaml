@@ -1,9 +1,8 @@
 name: kanban-task-threads
 version: 0.4.1
 description: >-
-  Every kanban task gets a forum thread of its own: the first post is a live
-  status card rewritten in place, the replies are the append-only log. Discord
-  is the first transport.
+  Kanban task threads with live status cards and append-only replies. Optional
+  multi-board routing supports shared forums and first-block-only provisioning.
 author: diego
 license: MIT
 homepage: https://github.com/diegomarino/kanban-task-threads
@@ -15,11 +14,11 @@ tags:
   - kanban
   - notifications
   - visibility
-requires_env:
-  - name: KANBAN_TASK_THREADS_WEBHOOK_URL
-    description: Discord webhook bound to the forum channel the cards publish to
-    secret: true
+requires_env: []
 optional_env:
+  - name: KANBAN_TASK_THREADS_WEBHOOK_URL
+    description: Required in legacy mode; boards mode uses explicit named secret references instead
+    secret: true
   - name: KANBAN_TASK_THREADS_BOT_TOKEN
     description: >-
       Optional existing publisher bot token; role needs forum-scoped
@@ -36,6 +35,18 @@ provides_hooks:
   - on_kanban_worker_stale_claim
   - on_kanban_dispatch_tick
 config_schema:
+  boards:
+    type: list
+    description: >-
+      Opt-in nonempty explicit routes: board, forum_channel_id, webhook_secret,
+      optional bot_token_secret, discord_applied_tag_ids and dashboard_url.
+      Secret fields are names only, never credentials. Omit for legacy mode.
+  thread_creation:
+    type: str
+    default: all
+    description: >-
+      all preserves legacy provisioning; first_blocked opens one board-qualified
+      thread on the first observed durable block and reuses it thereafter.
   board:
     type: str
     default: ''

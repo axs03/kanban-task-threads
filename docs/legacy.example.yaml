@@ -1,0 +1,14 @@
+# Example only; do not apply without deployment authorization.
+# Omit both boards and thread_creation to keep upstream all-card behavior.
+# Legacy runtime requires scoped KANBAN_TASK_THREADS_WEBHOOK_URL;
+# KANBAN_TASK_THREADS_BOT_TOKEN remains optional.
+plugins:
+  entries:
+    kanban-task-threads:
+      enabled: true
+      settings:
+        publisher_profile: default
+        board: default
+        poll_seconds: 20
+        # Optional even in legacy single-board routing:
+        # thread_creation: first_blocked

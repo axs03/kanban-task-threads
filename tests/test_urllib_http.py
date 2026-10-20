@@ -47,7 +47,13 @@ def test_sends_identifying_user_agent(monkeypatch):
 
 
 def test_extra_headers_are_sent(monkeypatch):
-    seen = capture_request(monkeypatch)
+    seen = {}
+
+    def fake_open(request, timeout=None):
+        seen["request"] = request
+        return FakeResponse(json.dumps({"id": "1"}).encode())
+
+    monkeypatch.setattr(transport_mod._NO_REDIRECT_OPENER, "open", fake_open)
     urllib_http(
         "GET", "https://discord.com/api/v10/channels/7", None, headers={"Authorization": "Bot x"}
     )
