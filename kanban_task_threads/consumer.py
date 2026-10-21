@@ -25,9 +25,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .blockers import BlockerEvidenceError, event_payload, is_blocker
+from .recovery import BlockerRecovery
 from .render import (
     COMMENTED_EXCERPT_TEMPLATE,
     CONTENT_LIMIT,
+    failure_detail,
     render_card,
     render_reply,
     render_thread_name,
@@ -170,6 +173,7 @@ class Consumer:
         self._next_metadata_audit_at = 0
         self._metadata_audit_level = 0
         self._forum_prepared = False
+        self._recovery = None
 
     def run_once(self, now: int | None = None) -> Report:
         """One full pass: acquire the fenced lease, scan events past the board
@@ -237,6 +241,14 @@ class Consumer:
                     self._activation = self._store.activate(self._board, watermark, blocked)
                 finally:
                     conn.rollback()
+                self._recovery = BlockerRecovery(self._store, self._board)
+                migration_done = self._recovery.discover(
+                    conn, native_path, self._activation, watermark, report
+                )
+                if not migration_done:
+                    # Finish bounded discovery before any forward reply can
+                    # leap over an older, not-yet-discovered missed trigger.
+                    return report
 
             if CAP_TAGS in self._transport.capabilities() and not self._forum_prepared:
                 if not owns_lease():
@@ -263,20 +275,31 @@ class Consumer:
                 self._forum_prepared = True
 
             cursor = self._store.get_cursor(self._board)
+            if self._recovery is not None:
+                self._recovery.replay(self, conn, now, report)
+                held = self._recovery.held_tasks()
+            else:
+                held = set()
             events = conn.execute(
                 "SELECT id, task_id, kind, payload, created_at "
-                "FROM task_events WHERE id > ? ORDER BY id",
-                (cursor,),
+                "FROM task_events WHERE id > ? ORDER BY id LIMIT ?",
+                (cursor, 256 if self._recovery is not None else -1),
             ).fetchall()
             by_task: dict = {}
             for row in events:
                 by_task.setdefault(row["task_id"], []).append(row)
+            for task_id in held:
+                task_events = by_task.pop(task_id, [])
+                if task_events:
+                    self._recovery.defer(task_id, task_events)
             if self._thread_creation == "first_blocked":
                 for task_id in self._store.bootstrap_tasks(self._board):
+                    if task_id in held:
+                        continue
                     by_task.setdefault(task_id, [])
             aborted = False
 
-            if by_task:
+            if by_task or events:
                 batch_max = events[-1]["id"] if events else cursor
                 floor = batch_max
                 for task_id, task_events in by_task.items():
@@ -291,7 +314,11 @@ class Consumer:
                         pos = self._position_of(task_id)
                     floor = min(floor, pos)
                 if not aborted and floor > cursor:
-                    self._store.advance_cursor(self._board, old=cursor, new=floor)
+                    if owns_lease():
+                        self._store.advance_cursor(self._board, old=cursor, new=floor)
+                    else:
+                        report.warnings.append("lease lost before forward cursor checkpoint")
+                        aborted = True
 
             # The stale sweep (ADR-0001), two-way — heartbeats are not events:
             # a card showing "running" whose heartbeat went quiet must turn
@@ -362,7 +389,15 @@ class Consumer:
         return post["last_event_id"] if post else self._store.scan_position(self._board, task_id)
 
     def _process_task(
-        self, conn, task_id: str, events, batch_max: int, now: int, report: Report
+        self,
+        conn,
+        task_id: str,
+        events,
+        batch_max: int,
+        now: int,
+        report: Report,
+        *,
+        recovery_start: int | None = None,
     ) -> int:
         """Returns the scan low-water mark this task needs: batch_max when it
         needs nothing more from this batch, its durable position otherwise."""
@@ -401,15 +436,33 @@ class Consumer:
             self._store.finish_bootstrap(board, task_id)
             return batch_max
         if self._thread_creation == "first_blocked" and (not post or not post["thread_id"]):
-            pos = self._position_of(task_id)
-            eligible = [
-                r["id"]
-                for r in events
-                if r["kind"] == "blocked" and r["id"] > max(pos, self._activation)
-            ]
+            pos = self._position_of(task_id) if recovery_start is None else recovery_start
+            eligible = []
+            poisoned = False
+            for r in events:
+                if r["id"] <= (max(pos, self._activation) if recovery_start is None else pos):
+                    continue
+                try:
+                    if is_blocker(conn, r):
+                        eligible.append(r["id"])
+                except BlockerEvidenceError as exc:
+                    # A poison event must not pin the cursor or re-report the
+                    # same error every pass: quarantine it durably (F2) and
+                    # hold the task out for manual reconciliation.
+                    self._recovery.quarantine_forward(
+                        task_id, r["id"], r["kind"], r["payload"], str(exc)
+                    )
+                    report.errors.append(f"{task_id}: blocker evidence quarantined: {exc}")
+                    poisoned = True
+            if poisoned:
+                self._recovery.defer(task_id, events)
+                return batch_max
             bootstrap = task_id in store.bootstrap_tasks(board)
             if not eligible and not bootstrap:
-                store.checkpoint_scan(board, task_id, batch_max)
+                if recovery_start is None:
+                    store.checkpoint_scan(board, task_id, batch_max)
+                else:
+                    self._recovery.checkpoint(task_id, batch_max)
                 return batch_max
             # Replies start at the first qualifying block, never at creation.
             # A bootstrap obligation's snapshot block is already durable (its
@@ -418,7 +471,11 @@ class Consumer:
             # unblock/comment updates. Non-bootstrap cards anchor at the first
             # block in this window (pre-block events stay suppressed).
             start = self._activation if bootstrap else min(eligible) - 1
-            store.checkpoint_scan(board, task_id, max(pos, start))
+            if recovery_start is None:
+                store.checkpoint_scan(board, task_id, max(pos, start))
+            else:
+                recovery_start = max(pos, start)
+                self._recovery.checkpoint(task_id, recovery_start)
         view = self._view_for(conn, task_id, task_row, now)
         card = render_card(view, template=self._card_template)
 
@@ -429,7 +486,13 @@ class Consumer:
             store.begin_create(board, task_id, now=now)
             if self._thread_creation == "first_blocked":
                 store.set_task_position(
-                    board, task_id, last_event_id=store.scan_position(board, task_id)
+                    board,
+                    task_id,
+                    last_event_id=(
+                        store.scan_position(board, task_id)
+                        if recovery_start is None
+                        else recovery_start
+                    ),
                 )
             try:
                 ref = self._transport.open_thread(title=thread_name, card=card)
@@ -464,6 +527,8 @@ class Consumer:
             pos = post["last_event_id"]
 
         # -- replies, then one card refresh ----------------------------------
+        if recovery_start is not None:
+            pos = recovery_start
         replied = 0
         start_pos = pos
         edited = False
@@ -496,7 +561,10 @@ class Consumer:
                         )
                         replied += 1
                 pos = row["id"]
-                store.set_task_position(board, task_id, last_event_id=pos)
+                if recovery_start is not None:
+                    self._recovery.checkpoint(task_id, pos)
+                else:
+                    store.set_task_position(board, task_id, last_event_id=pos)
             report.replied += replied
             # Refresh the card when something actually happened — or when a
             # prior failure left it dirty. A pinned-cursor rescan with no new
@@ -507,6 +575,11 @@ class Consumer:
                 self._store.set_card_dirty(board, task_id, False)
                 report.edited.append(task_id)
                 edited = True
+            if recovery_start is not None:
+                # Reconciliation may have suppressed the final poison row of
+                # this chunk. All remaining events succeeded; checkpoint that
+                # deliberate gap as well, never a failed/guard-refused batch.
+                self._recovery.checkpoint(task_id, batch_max)
         except TransportError as err:
             report.replied += replied
             return self._publish_failed(task_id, err, now, report, batch_max, pos)
@@ -981,12 +1054,18 @@ class Consumer:
 
     def _last_block_reason(self, conn, task_id: str) -> str:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
-            "ORDER BY id DESC LIMIT 1",
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'gave_up') ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row and row["payload"]:
-            return str(json.loads(row["payload"]).get("reason", ""))
+            try:
+                payload = event_payload(row)
+            except BlockerEvidenceError:
+                return ""  # malformed blocker payload: no reason to surface
+            if row["kind"] == "gave_up":
+                return failure_detail(payload.get("error", ""))
+            return str(payload.get("reason", ""))
         return ""
 
 

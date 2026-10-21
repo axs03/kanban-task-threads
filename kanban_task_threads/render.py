@@ -8,6 +8,7 @@ Truncation is deterministic at Discord's limits (ADR-0007): a poison event must
 render to the same, in-bounds text every time rather than 400 forever.
 """
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -55,7 +56,7 @@ DEFAULT_REPLY_TEMPLATES = {
     "completed": "🏁 completed{summary_part}",
     "review_requested": "🔎 review requested{reviewer_part}{summary_part}",
     "changes_requested": "✏️ changes requested{reason_part}",
-    "gave_up": "🛑 gave up{reason_part}",
+    "gave_up": "🛑 gave up{trigger_part}{reason_part}",
     "crashed": "💥 worker crashed",
     "timed_out": "⏱️ timed out",
     "reclaimed": "♻️ claim reclaimed",
@@ -86,6 +87,36 @@ def truncate(text: str, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
+def failure_detail(value) -> str:
+    """Bound new automatic error egress; strip controls, URLs and credentials.
+
+    Not a universal secret detector: arbitrary unlabelled secret text in native
+    evidence is outside the safe operational-error contract.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value[:8000])
+    # Establish the final printable representation before matching secrets.
+    # Whitespace controls remain token boundaries; non-whitespace controls
+    # cannot hide a label, Bearer prefix or URL scheme and reappear after it.
+    text = " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
+    text = re.sub(r"https?://\S+", "[redacted URL]", text, flags=re.I)
+    # Every supported label may prefix its value with Bearer. Consume both
+    # together so the label cannot redact just "Bearer" and strand its token.
+    # Values run to whitespace, including any `;`/`,` within the secret.
+    text = re.sub(
+        r"\b(?:api[_-]?key|token|password|passwd|secret|authorization|credential)"
+        r"\s*[:=]\s*(?:bearer\s+)?\S+"
+        r"|\bbearer\s+\S+"
+        r"|\bsk_[A-Za-z0-9_]+"
+        r"|\bsk-[A-Za-z0-9-]+",
+        "[redacted]",
+        text,
+        flags=re.I,
+    )
+    return truncate(text.replace("@", "＠").replace("`", "'"), 500)
+
+
 def resolve_status_key(status: str, block_kind: str) -> str:
     """Board status → presentation key. The one non-identity case: a
     dependency block routes to `todo` on the board, so it gets its own key or
@@ -107,9 +138,13 @@ def render_card(view: Mapping[str, str], *, template: str | None = None) -> Card
     values["status_label"] = label
     block_kind = view.get("block_kind", "")
     block_reason = view.get("block_reason", "")
-    # The reason is read from the last `blocked` event and outlives the block;
-    # only a block that is *present* (a kind on the task row) earns the line.
-    values["block_line"] = f"waiting on: `{block_kind}` — {block_reason}\n" if block_kind else ""
+    # Native unblock intentionally retains block_kind. Current status, not that
+    # historical classification, decides whether this is a present blocker.
+    values["block_line"] = ""
+    if key == "blocked" and (block_kind or block_reason):
+        values["block_line"] = f"waiting on: `{block_kind or 'failure'}` — {block_reason}\n"
+    elif key == "dependency_wait":
+        values["block_line"] = f"waiting on: `dependency` — {block_reason}\n"
     # task_links are prerequisites (ADR-0012): a dependent rolls up what
     # gates it; a prerequisite names what it unlocks.
     depends = view.get("depends", "")
@@ -213,6 +248,16 @@ def render_reply(kind: str, payload: Mapping, *, template: str | None = None) ->
         "reviewer": "",
     }
     values.update({k: str(v) for k, v in payload.items() if isinstance(v, (str, int, float, bool))})
+    values["trigger_part"] = ""
+    if kind == "gave_up":
+        detail = failure_detail(payload.get("error", payload.get("reason", "")))
+        values["reason"] = detail
+        # Overwrite the raw scalar so a custom `{error}` template cannot bypass
+        # failure_detail (F3/D3).
+        values["error"] = detail
+        trigger = payload.get("trigger_outcome")
+        if trigger in ("spawn_failed", "crashed", "timed_out", "reclaimed"):
+            values["trigger_part"] = f" ({trigger})"
     values["summary_part"] = f" — {values['summary']}" if values["summary"] else ""
     values["reason_part"] = f": {values['reason']}" if values["reason"] else ""
     values["reviewer_part"] = f" → {values['reviewer']}" if values["reviewer"] else ""

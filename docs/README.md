@@ -24,3 +24,5 @@ new:
    what is templatable and what never will be.
 8. [testing.md](testing.md) — the four layers, the sandbox, the doubles, and
    which tests are pins rather than TDD.
+9. [known-issues.md](known-issues.md) — confirmed deferred regressions,
+   reproduction evidence, impact and required future repair checks.

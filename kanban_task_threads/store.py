@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS scans (
     board TEXT NOT NULL, task_id TEXT NOT NULL, last_event_id INTEGER NOT NULL,
     PRIMARY KEY(board, task_id)
 );
+CREATE TABLE IF NOT EXISTS blocker_migration (
+    board TEXT NOT NULL, version INTEGER NOT NULL, identity TEXT NOT NULL,
+    highwater INTEGER NOT NULL, position INTEGER NOT NULL, done INTEGER NOT NULL,
+    PRIMARY KEY(board, version)
+);
+CREATE TABLE IF NOT EXISTS blocker_recovery (
+    board TEXT NOT NULL, version INTEGER NOT NULL, task_id TEXT NOT NULL,
+    evidence_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT,
+    replay_position INTEGER NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(board, version, task_id, evidence_id)
+);
 """
 
 
@@ -125,7 +136,16 @@ class StateStore:
     # --- cursor ---------------------------------------------------------------
 
     def check_binding(self, board: str, destination: str, *, adopting=False) -> None:
-        for table in ("posts", "cursor", "activation", "bootstrap", "scans", "board_binding"):
+        for table in (
+            "posts",
+            "cursor",
+            "activation",
+            "bootstrap",
+            "scans",
+            "board_binding",
+            "blocker_migration",
+            "blocker_recovery",
+        ):
             if self._conn.execute(
                 f"SELECT 1 FROM {table} WHERE board != ? LIMIT 1", (board,)
             ).fetchone():
