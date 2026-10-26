@@ -553,11 +553,21 @@ class Consumer:
                             render_reply(row["kind"], payload, template=template), ref, task_id
                         )
                         username = reply_username(row["kind"], payload, task_row["assignee"])
+                        extra = {}
+                        # Ping on every human-relevant blocker; a thread opened
+                        # this pass already pinged via its starter message.
+                        if (
+                            not opened
+                            and row["kind"] in ("blocked", "gave_up")
+                            and payload.get("kind") != "dependency"
+                        ):
+                            extra["mention"] = True
                         self._transport.append(
                             ref,
                             content=content,
                             username=username,
                             message_type=row["kind"],
+                            **extra,
                         )
                         replied += 1
                 pos = row["id"]

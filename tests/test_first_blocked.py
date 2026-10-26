@@ -88,3 +88,40 @@ def test_bootstrap_obligation_survives_failed_create_and_restart(tmp_path):
         sqlite3.connect(tmp_path / "state.db").execute("PRAGMA integrity_check").fetchone()[0]
         == "ok"
     )
+
+
+def test_append_mentions_only_when_requested():
+    from kanban_task_threads.transport import DiscordTransport
+
+    calls = []
+
+    def http(method, url, body, headers=None):
+        calls.append(body)
+        return 200, {"id": "1", "channel_id": "2"}
+
+    from kanban_task_threads.transport import ThreadRef
+
+    t = DiscordTransport(http, "https://discord.com/api/webhooks/1/x", mention_user_id="42")
+    ref = ThreadRef(thread_id="2", message_id="3")
+    t.append(ref, content="plain")
+    t.append(ref, content="alert", mention=True)
+    assert calls[0]["allowed_mentions"] == {"parse": []}
+    assert calls[1]["content"].startswith("<@42> ")
+    assert calls[1]["allowed_mentions"] == {"parse": [], "users": ["42"]}
+
+
+def test_routing_warns_about_unconfigured_boards(tmp_path):
+    import logging
+    from types import SimpleNamespace
+
+    from kanban_task_threads.routing import _warn_unconfigured_boards
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "kanban.db").touch()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "kanban.db").touch()
+    seen = []
+    logger = SimpleNamespace(warning=lambda fmt, *a: seen.append(fmt % a))
+    db = SimpleNamespace(boards_root=lambda: tmp_path)
+    _warn_unconfigured_boards([SimpleNamespace(board="a"), SimpleNamespace(board="default")], db, logger)
+    assert len(seen) == 1 and "b" in seen[0] and "a," not in seen[0]

@@ -285,6 +285,22 @@ def _safe_http(http, credentials, check):
     return call
 
 
+def _warn_unconfigured_boards(routes, db, logger):
+    """Boards on disk but absent from `boards:` are silently never published."""
+    try:
+        configured = {r.board for r in routes}
+        root = Path(db.boards_root())
+        on_disk = {"default"} | {p.name for p in root.iterdir() if (p / "kanban.db").is_file()}
+        missing = sorted(on_disk - configured)
+    except Exception:
+        return
+    if missing:
+        logger.warning(
+            "kanban-task-threads: boards not configured, no Discord threads or pings: %s",
+            ", ".join(missing),
+        )
+
+
 def build_multiboard(ctx, logger):
     """No effect-capable consumers exist until the entire registry is verified."""
     from agent import secret_scope
@@ -294,6 +310,7 @@ def build_multiboard(ctx, logger):
 
     routes = parse_routes(ctx)
     files = resolve_files(routes, db)
+    _warn_unconfigured_boards(routes, db, logger)
     secrets = []
     try:
         for route in routes:

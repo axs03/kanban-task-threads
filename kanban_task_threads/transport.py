@@ -110,6 +110,7 @@ class Transport(Protocol):
         content: str,
         username: str | None = None,
         message_type: str = "default",
+        mention: bool = False,
     ) -> str: ...
 
 
@@ -184,10 +185,16 @@ class DiscordTransport:
         content: str,
         username: str | None = None,
         message_type: str = "default",
+        mention: bool = False,
     ) -> str:
+        mentions = _NO_MENTIONS
+        if mention and self._mention_user_id:
+            # Owner opt-in alert (blocker replies): ping exactly one user.
+            content = f"<@{self._mention_user_id}> {content}"
+            mentions = {"parse": [], "users": [self._mention_user_id]}
         body = {
             "content": truncate(content, CONTENT_LIMIT),
-            "allowed_mentions": _NO_MENTIONS,
+            "allowed_mentions": mentions,
         }
         if self._avatars:
             avatar_type = self._avatars.resolve_message_type(message_type)
