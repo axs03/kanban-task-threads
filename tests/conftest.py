@@ -160,9 +160,11 @@ class FakeTransport:
         self.calls.append(("edit_card", ref, card))
         self._maybe_raise("edit_card")
 
-    def append(self, ref, *, content, username=None, message_type="default"):
+    def append(self, ref, *, content, username=None, message_type="default", mention=False):
         self.calls.append(("append", ref, content, username))
         self.message_types.append(message_type)
+        self.mentions = getattr(self, "mentions", [])
+        self.mentions.append(mention)
         self._maybe_raise("append")
         self._n += 1
         return f"msg{self._n}"

@@ -69,6 +69,41 @@ def test_scope_present_without_secret_is_a_config_verdict(entry):
     assert module._build_consumer(FakeCtx()) is None
 
 
+def test_legacy_credentials_can_opt_into_first_blocked(entry, tmp_path):
+    from conftest import add_event, insert_task, make_board
+    from test_register import ConfiguredCtx
+
+    http = FakeHttp()
+    http.queue(200, {"id": "1", "channel_id": "7"})
+    module = entry(WEBHOOK, http=http)
+    board = make_board(tmp_path / "kanban.db")
+    insert_task(board, "t_same")
+    add_event(board, "t_same", "created")
+    consumer = module._build_consumer(
+        ConfiguredCtx("default", {"thread_creation": "first_blocked"})
+    )
+    consumer.run_once(now=100)
+    assert len(http.calls) == 1
+    binding = consumer._store._conn.execute("SELECT destination FROM board_binding").fetchone()
+    assert binding[0] == "discord:webhook:1@7"
+    consumer.close()
+    consumer.close()  # unload/cleanup is idempotent
+    with pytest.raises(__import__("sqlite3").ProgrammingError):
+        consumer._store.get_cursor("default")
+
+
+def test_first_blocked_legacy_preflight_does_not_echo_credential_errors(entry):
+    from test_register import ConfiguredCtx
+
+    def explode(*args, **kw):
+        raise OSError(WEBHOOK["KANBAN_TASK_THREADS_WEBHOOK_URL"])
+
+    module = entry(WEBHOOK, http=explode)
+    with pytest.raises(retryable_of(module)) as error:
+        module._build_consumer(ConfiguredCtx("default", {"thread_creation": "first_blocked"}))
+    assert WEBHOOK["KANBAN_TASK_THREADS_WEBHOOK_URL"] not in str(error.value)
+
+
 def test_secret_scope_error_is_retryable(entry, monkeypatch):
     module = entry(WEBHOOK)
     sys.modules["agent.secret_scope"].get_secret = lambda *a, **k: (_ for _ in ()).throw(

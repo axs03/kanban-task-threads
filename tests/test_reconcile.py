@@ -70,3 +70,53 @@ def test_recreate_drops_the_row_so_a_fresh_post_opens(db):
 def test_unknown_task_raises(db):
     with pytest.raises(reconcile.ReconcileError):
         reconcile.rearm(db, "default", "t_nope")
+
+
+def test_bound_file_rejects_foreign_board_mutation(db):
+    store = StateStore(db)
+    store._conn.execute("INSERT INTO board_binding VALUES ('default', 'discord:webhook:1@7')")
+    store.begin_create("nib", "t_pending", now=1)
+    with pytest.raises(reconcile.ReconcileError):
+        reconcile.clear(db, "nib", "t_pending")
+    assert store.get_post("nib", "t_pending") is not None
+
+
+def test_adopt_can_record_verified_public_destination_without_secret(db):
+    reconcile.adopt(
+        db,
+        "default",
+        "t_pending",
+        thread_id="found",
+        message_id="starter",
+        destination="discord:webhook:1@7",
+    )
+    assert StateStore(db).get_post("default", "t_pending")["destination"] == "discord:webhook:1@7"
+
+
+def test_bound_adopt_rejects_destination_change(db):
+    store = StateStore(db)
+    store._conn.execute("INSERT INTO board_binding VALUES ('default', 'discord:webhook:1@7')")
+    with pytest.raises(reconcile.ReconcileError):
+        reconcile.adopt(
+            db,
+            "default",
+            "t_pending",
+            thread_id="found",
+            message_id="starter",
+            destination="discord:webhook:1@9",
+        )
+    assert store.get_post("default", "t_pending")["pending_create_at"] == 200
+
+
+def test_reconcile_refuses_aliased_state_file(db, tmp_path):
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(db)
+    with pytest.raises(reconcile.ReconcileError):
+        reconcile.clear(alias, "default", "t_pending")
+
+
+def test_bound_pending_adopt_uses_its_verified_binding(db):
+    store = StateStore(db)
+    store._conn.execute("INSERT INTO board_binding VALUES ('default', 'discord:webhook:1@7')")
+    reconcile.adopt(db, "default", "t_pending", thread_id="found", message_id="starter")
+    assert store.get_post("default", "t_pending")["destination"] == "discord:webhook:1@7"

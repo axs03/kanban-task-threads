@@ -105,6 +105,8 @@ def register(ctx):
     from .kanban_task_threads.runtime import Runtime
 
     profile_context = contextvars.copy_context()
+    absent = object()
+    explicit_registry = ctx.get_config("boards", absent) is not absent
     runtime = Runtime(
         lambda: _build_consumer(ctx),
         logger=logger,
@@ -118,7 +120,11 @@ def register(ctx):
     )
 
     def _kick(**kwargs):
-        runtime.kick(context=contextvars.copy_context())
+        # Explicit central polling belongs to the registration context. A worker
+        # may wake it, but cannot donate a fence/current-board/secret context.
+        # A fenced registration itself is still refused by registry resolution.
+        context = profile_context.copy() if explicit_registry else contextvars.copy_context()
+        runtime.kick(context=context)
 
     for hook in KICK_HOOKS:
         ctx.register_hook(hook, _kick)
@@ -148,6 +154,17 @@ def _build_consumer(ctx):
     Returning None degrades the plugin to a no-op (ADR-0003: requires_env is
     not a load gate; never queue work that can never be sent).
     """
+    from .kanban_task_threads.routing import RoutingError, build_multiboard, creation_mode
+
+    try:
+        mode = creation_mode(ctx)
+        absent = object()
+        if ctx.get_config("boards", absent) is not absent:
+            return build_multiboard(ctx, logger)
+    except RoutingError as error:
+        logger.error("kanban-task-threads: %s; plugin is inactive", error)
+        return None
+
     import os
     from pathlib import Path
 
@@ -174,6 +191,8 @@ def _build_consumer(ctx):
         webhook_url = secret_scope.get_secret(_SECRET_WEBHOOK)
         bot_token = secret_scope.get_secret(_SECRET_BOT)
     except Exception as exc:  # e.g. UnscopedSecretError under multiplexing
+        if mode == "first_blocked":
+            raise RetryableStartup("publisher scoped credentials unavailable") from None
         raise RetryableStartup(f"secret scope unavailable in this kick's context: {exc!r}") from exc
     if not webhook_url:
         if secret_scope.current_secret_scope() is None:
@@ -222,6 +241,11 @@ def _build_consumer(ctx):
                     exc,
                 )
                 avatars = AvatarSet.official()
+
+    if mode == "first_blocked":
+        from .kanban_task_threads.routing import _safe_http
+
+        urllib_http = _safe_http(urllib_http, (webhook_url, bot_token), lambda: None)
 
     tags = tuple(ctx.get_config("discord_applied_tag_ids") or ())
     transport = DiscordTransport(
@@ -289,7 +313,7 @@ def _build_consumer(ctx):
         info.get("channel_id"),
         info.get("name"),
     )
-    return Consumer(
+    consumer = Consumer(
         kanban_db_path(board),
         state,
         transport,
@@ -303,5 +327,27 @@ def _build_consumer(ctx):
         reply_templates=ctx.get_config("reply_templates") or {},
         comment_excerpt_chars=int(ctx.get_config("comment_excerpt_chars", 180) or 0),
         guild_id=str(info.get("guild_id") or ""),
+        thread_creation=mode,
+        require_binding=mode == "first_blocked",
+        owns_store=mode == "first_blocked",
         **kwargs,
     )
+    if mode == "first_blocked":
+        from functools import partial
+
+        from .kanban_task_threads.coordination import forum_lock
+
+        consumer._forum_lock = partial(
+            forum_lock,
+            Path(kanban_home())
+            / "kanban/plugins/kanban-task-threads"
+            / f"forum-{info['channel_id']}.lock",
+            parent=(
+                (Path(kanban_home()) / "kanban/plugins/kanban-task-threads").stat().st_dev,
+                (Path(kanban_home()) / "kanban/plugins/kanban-task-threads").stat().st_ino,
+            ),
+        )
+        transport._http = _safe_http(
+            urllib_http, (webhook_url, bot_token), consumer._assert_effect_ownership
+        )
+    return consumer

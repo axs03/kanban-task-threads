@@ -19,24 +19,51 @@ Verbs:
              (same future-events caveat)
 """
 
+import re
 import sqlite3
+import time
+from contextlib import contextmanager
 from pathlib import Path
+
+from .routing import RoutingError, check_sidecars
 
 
 class ReconcileError(RuntimeError):
     """The verb does not apply to this row's actual situation."""
 
 
-def _connect(db_path) -> sqlite3.Connection:
+@contextmanager
+def _connect(db_path):
     if not Path(db_path).exists():
         raise ReconcileError(f"no state DB at {db_path}")
+    path = Path(db_path).absolute()
+    if path.resolve() != path or path.stat().st_nlink != 1:
+        raise ReconcileError("state file alias; reconciliation refused")
+    try:
+        check_sidecars(path)
+    except RoutingError as exc:
+        raise ReconcileError("state SQLite sidecar is aliased; reconciliation refused") from exc
     conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _post(conn, board: str, task_id: str) -> sqlite3.Row:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'board_binding'").fetchone():
+        bindings = conn.execute("SELECT board FROM board_binding").fetchall()
+        if bindings and any(binding[0] != board for binding in bindings):
+            raise ReconcileError("board does not own this state file")
+    if conn.execute(
+        "SELECT 1 FROM leases WHERE name = ? AND expires_at > ?",
+        (f"consume:{board}", int(time.time())),
+    ).fetchone():
+        raise ReconcileError("publisher lease active; quiesce it before reconciling")
     row = conn.execute(
         "SELECT * FROM posts WHERE board = ? AND task_id = ?", (board, task_id)
     ).fetchone()
@@ -70,11 +97,45 @@ def clear(db_path, board: str, task_id: str) -> None:
         conn.execute("DELETE FROM posts WHERE board = ? AND task_id = ?", (board, task_id))
 
 
-def adopt(db_path, board: str, task_id: str, *, thread_id: str, message_id: str) -> None:
+def adopt(
+    db_path,
+    board: str,
+    task_id: str,
+    *,
+    thread_id: str,
+    message_id: str,
+    destination: str | None = None,
+) -> None:
     """The create actually succeeded: attach the thread found on the forum
     (its id is in the thread name, `title · task_id`) and go live."""
     with _connect(db_path) as conn:
         _post(conn, board, task_id)
+        binding = None
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'board_binding'").fetchone():
+            binding = conn.execute(
+                "SELECT destination FROM board_binding WHERE board = ?", (board,)
+            ).fetchone()
+        if destination is None and binding:
+            destination = binding[0]
+        if destination is not None:
+            if (
+                not isinstance(destination, str)
+                or re.fullmatch(r"discord:webhook:[1-9][0-9]{0,19}@[1-9][0-9]{0,19}", destination)
+                is None
+            ):
+                raise ReconcileError(
+                    "destination must be a public webhook/forum identity, never credentials"
+                )
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'board_binding'").fetchone():
+                binding = conn.execute(
+                    "SELECT destination FROM board_binding WHERE board = ?", (board,)
+                ).fetchone()
+                if binding and binding[0] != destination:
+                    raise ReconcileError("destination conflicts with board binding")
+            conn.execute(
+                "UPDATE posts SET destination = ? WHERE board = ? AND task_id = ?",
+                (destination, board, task_id),
+            )
         conn.execute(
             "UPDATE posts SET thread_id = ?, message_id = ?, state = 'live', "
             "pending_create_at = NULL, detail = NULL "
@@ -125,7 +186,14 @@ def main(argv: list[str]) -> int:
         if verb == "clear":
             clear(db_path, board, task_id)
         elif verb == "adopt":
-            adopt(db_path, board, task_id, thread_id=args[2], message_id=args[3])
+            adopt(
+                db_path,
+                board,
+                task_id,
+                thread_id=args[2],
+                message_id=args[3],
+                destination=args[4] if len(args) > 4 else None,
+            )
         elif verb == "rearm":
             rearm(db_path, board, task_id)
         elif verb == "recreate":

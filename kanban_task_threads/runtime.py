@@ -181,26 +181,32 @@ class Runtime:
         # validate probe. A kick collapses the wait, so hook-driven profiles
         # keep building immediately.
         consumer = None
-        while not self._stopping.is_set():
-            self._kicked.wait(self._poll)
-            self._kicked.clear()
-            if self._stopping.is_set():
-                break
-            if consumer is None:
-                consumer = self._build_once()
-                if consumer is None:
-                    if self._disabled:
-                        return  # a config verdict — permanent until a reload
-                    continue  # deferred — try again next interval, or next kick
+        try:
+            while not self._stopping.is_set():
+                self._kicked.wait(self._poll)
+                self._kicked.clear()
                 if self._stopping.is_set():
-                    break  # unload began while the build/preflight was in flight
-            if self._stopping.is_set():
-                break  # the last gate before a pass: unload began, do not start one
-            try:
-                report = consumer.run_once()
-                for line in report.errors:
-                    self._log.error("kanban-task-threads: %s", line)
-                for line in getattr(report, "warnings", ()):
-                    self._log.warning("kanban-task-threads: %s", line)
-            except Exception:
-                self._log.exception("kanban-task-threads: consume pass failed; will retry")
+                    break
+                if consumer is None:
+                    consumer = self._build_once()
+                    if consumer is None:
+                        if self._disabled:
+                            return
+                        continue
+                    set_stop = getattr(consumer, "set_stop_event", None)
+                    if callable(set_stop):
+                        set_stop(self._stopping)
+                if self._stopping.is_set():
+                    break  # unload during build: close, never start a pass
+                try:
+                    report = consumer.run_once()
+                    for line in report.errors:
+                        self._log.error("kanban-task-threads: %s", line)
+                    for line in getattr(report, "warnings", ()):
+                        self._log.warning("kanban-task-threads: %s", line)
+                except Exception:
+                    self._log.exception("kanban-task-threads: consume pass failed; will retry")
+        finally:
+            close = getattr(consumer, "close", None)
+            if callable(close):
+                close()

@@ -46,7 +46,17 @@ def run_checks():
     # Install before importing Hermes. An unexpected external effect fails the
     # check; the real scope loader may only read the synthetic profile files.
     def deny_external_effects(event, args):
-        if event in {"socket.connect", "socket.getaddrinfo", "subprocess.Popen", "os.system"}:
+        if event in {
+            "socket.connect",
+            "socket.getaddrinfo",
+            "socket.gethostbyname",
+            "socket.gethostbyaddr",
+            "socket.sendto",
+            "socket.sendmsg",
+            "socket.bind",
+            "subprocess.Popen",
+            "os.system",
+        }:
             raise AssertionError(f"Unexpected external effect: {event}")
 
     sys.addaudithook(deny_external_effects)
@@ -74,6 +84,21 @@ def run_checks():
     )
 
     class StartupChecks(unittest.TestCase):
+        def test_offline_guard_covers_all_network_audit_events(self):
+            # Dispatch audit events only: never make an unguarded network call
+            # even when demonstrating that the test harness needs another gate.
+            for event in (
+                "socket.connect",
+                "socket.getaddrinfo",
+                "socket.gethostbyname",
+                "socket.gethostbyaddr",
+                "socket.sendto",
+                "socket.sendmsg",
+                "socket.bind",
+            ):
+                with self.subTest(event=event), self.assertRaises(AssertionError):
+                    sys.audit(event, None)
+
         def setUp(self):
             self.directory = tempfile.TemporaryDirectory(dir=os.environ["HOME"])
             self.addCleanup(self.directory.cleanup)
@@ -200,6 +225,86 @@ def run_checks():
                     self.assertEqual(
                         connection.execute("SELECT count(*) FROM task_events").fetchone(), (0,)
                     )
+
+        def test_real_multiboard_shared_forum_first_blocked(self):
+            from hermes_cli import kanban_db
+
+            if not all(
+                callable(getattr(kanban_db, key, None))
+                for key in (
+                    "board_exists",
+                    "_explicit_board_intent_pinned",
+                    "kanban_db_path",
+                    "kanban_home",
+                )
+            ):
+                self.skipTest("Older Hermes lacks the safety APIs required for opt-in boards mode")
+
+            fixture_spec = importlib.util.spec_from_file_location(
+                "ktt_multiboard_fixture", ROOT / "tests/conftest.py"
+            )
+            fixture = importlib.util.module_from_spec(fixture_spec)
+            fixture_spec.loader.exec_module(fixture)
+            transport = __import__(
+                f"{spec.name}.kanban_task_threads.transport", fromlist=["urllib_http"]
+            )
+            routes = [
+                dict(board=board, forum_channel_id="777", webhook_secret="KTT_CHECK_HOOK")
+                for board in ("default", "fstream", "nib")
+            ]
+            settings = dict(boards=routes, thread_creation="first_blocked", avatars_enabled=False)
+
+            class Context:
+                profile_name = "default"
+
+                def get_config(self, key, default=None):
+                    return settings.get(key, default)
+
+            calls = []
+
+            def http(method, url, body, **kwargs):
+                calls.append((method, body))
+                if method == "GET":
+                    return 200, {"id": "123", "channel_id": "777"}
+                return 200, {"id": str(1000 + len(calls)), "channel_id": str(2000 + len(calls))}
+
+            (self.home / ".env").write_text(
+                "KTT_CHECK_HOOK=https://discord.com/api/webhooks/123/synthetic-offline-token\n"
+            )
+            with patch.dict(os.environ, {"HERMES_KANBAN_HOME": str(self.home)}):
+                for route in routes:
+                    board = route["board"]
+                    path = kanban_db.kanban_db_path(board)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if board != "default":
+                        (path.parent / "board.json").write_text("{}")
+                    conn = fixture.make_board(path)
+                    fixture.insert_task(conn, "t_same", status="blocked", assignee="some-worker")
+                    fixture.add_event(conn, "t_same", "blocked")
+                    conn.close()
+                runtime = runtime_module.Runtime(
+                    lambda: entry._build_consumer(Context()),
+                    refresh_context=entry._refresh_profile_context,
+                )
+                runtime._context = self.identity(self.home)
+                with patch.object(transport, "urllib_http", http):
+                    coordinator = runtime._build_once()
+                    self.assertIsNotNone(coordinator)
+                    try:
+                        report = coordinator.run_once(now=100)
+                        self.assertEqual(report.errors, [])
+                        self.assertEqual(len(report.opened), 3)
+                        titles = [
+                            body["thread_name"]
+                            for method, body in calls
+                            if method == "POST" and "thread_name" in body
+                        ]
+                        self.assertEqual(len(set(titles)), 3)
+                        count = len(calls)
+                        coordinator.run_once(now=101)
+                        self.assertEqual(len(calls), count)
+                    finally:
+                        coordinator.close()
 
         def test_deferred_start_retry_and_unload_without_hooks(self):
             self.check_deferred_start(self.home)

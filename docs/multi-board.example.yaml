@@ -1,0 +1,26 @@
+# Example only; deployment and live delivery need separate authorization.
+# Existing profiles only. All three boards intentionally share one forum/webhook.
+plugins:
+  entries:
+    kanban-task-threads:
+      enabled: true
+      settings:
+        publisher_profile: default
+        thread_creation: first_blocked
+        poll_seconds: 20
+        boards:
+          - board: default
+            forum_channel_id: '111111111111111111'
+            webhook_secret: KANBAN_TASK_THREADS_WEBHOOK_URL
+            # Optional; omit entirely for webhook-only operation.
+            bot_token_secret: KANBAN_TASK_THREADS_BOT_TOKEN
+          - board: fstream
+            forum_channel_id: '111111111111111111'
+            webhook_secret: KANBAN_TASK_THREADS_WEBHOOK_URL
+            bot_token_secret: KANBAN_TASK_THREADS_BOT_TOKEN
+            discord_applied_tag_ids: []
+          - board: nib
+            forum_channel_id: '111111111111111111'
+            webhook_secret: KANBAN_TASK_THREADS_WEBHOOK_URL
+            bot_token_secret: KANBAN_TASK_THREADS_BOT_TOKEN
+            discord_applied_tag_ids: []
