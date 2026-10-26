@@ -49,6 +49,11 @@ current-board fallback or ambient/global bot token is used in `boards` mode.
 - `thread_creation: all` (default) preserves upstream all-card provisioning.
   `thread_creation: first_blocked` enables the behavior below, with or without
   an explicit `boards` registry. Any other value is invalid.
+- `mention_user_id` (optional, decimal string) pings one user on thread creation
+  and on each `blocked`/`gave_up` reply except `dependency` blocks. Webhook
+  `allowed_mentions` otherwise stays `{"parse": []}`.
+- A board that exists on disk but has no `boards` entry is never published.
+  Startup logs `boards not configured, no Discord threads or pings: <slugs>`.
 - Shared cosmetic options, templates, `reply_on`, avatars, heartbeat staleness,
   workspace privacy and comment excerpts remain available.
 

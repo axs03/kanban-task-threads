@@ -73,6 +73,14 @@ the command with `--force`; that flag cannot override a `DANGEROUS` verdict.
 Do not disable install-time scanning. Prefer the catalog name and its reviewed,
 pinned commit for normal installations.
 
+**This fork** (multi-board publishing, first-block threads, owner pings) is
+installed from its own repository; the catalog entry tracks upstream only:
+
+```bash
+hermes plugins install axs03/kanban-task-threads
+hermes plugins enable kanban-task-threads
+```
+
 Set the secret in your profile's environment (through your secret manager —
 e.g. a 1Password `op://` reference — never a literal in config):
 
@@ -109,6 +117,20 @@ serves one board; point each board's deployment at its own forum's webhook.
 > must still set `discord_applied_tag_ids`, because a webhook cannot discover
 > or create forum tags.
 
+## Fork additions
+
+- **Multi-board publishing:** one publisher serves many boards through
+  `boards:`, sharing or separating forums
+  ([docs/multi-board.md](docs/multi-board.md)).
+- **First-block threads:** `thread_creation: first_blocked` creates a thread
+  only when a task first blocks.
+- **Owner pings:** with `mention_user_id`, new threads and every later
+  `blocked` or `gave_up` reply (kinds such as `capability` and `needs_input`)
+  ping that user. `dependency` blocks never ping.
+- **Silent-skip guard:** every board that exists on disk but is missing from
+  `boards:` is logged at startup. Add a route for each board you want
+  published.
+
 ## Configuration
 
 All optional, under `plugins.entries.<id>.settings`:
@@ -124,6 +146,9 @@ All optional, under `plugins.entries.<id>.settings`:
 | `avatar_base_url` | official catalog | Optional HTTPS directory containing 12 custom PNGs; blank uses the official versioned catalog |
 | `avatar_theme` | `duotone` | Official-catalog Phosphor weight: `duotone`, `fill`, or `bold`; ignored with a custom directory |
 | `avatar_palette` | `colored` | Official-catalog palette: `colored`, `black`, or `white`; ignored with a custom directory |
+| `boards` | — | Fork: list of per-board routes (`board`, `forum_channel_id`, `webhook_secret`, optional `bot_token_secret`) for one central publisher serving several boards. Boards missing from the list get no threads and no pings; startup logs a warning naming them. See [docs/multi-board.md](docs/multi-board.md) |
+| `thread_creation` | `all` | Fork: `all` opens a thread for every task; `first_blocked` opens one only when a task first blocks |
+| `mention_user_id` | — | Fork: Discord user ID (decimal string) to ping. Pinged on thread creation and on every later `blocked`/`gave_up` reply, except `dependency` blocks, which resume on their own. Only this one user is ever mentioned; `<@…>` text in agent output stays inert |
 | `poll_seconds` | `20` | Seconds between passes when no hook kicks arrive |
 | `stale_after_seconds` | `600` | Heartbeat age after which a running task renders as stale |
 | `dashboard_url` | — | Task page URL; may contain `{task_id}` and `{board}`. Powers the card link and each reply's trailing `[#]` (without it, `[#]` jumps to the card in-app). **Links are forever**: every URL you publish is frozen in Discord permanently, so use a stable *name* that resolves from every device you click from — never an IP (the plugin warns on literal IPs), never anything discovered at boot |
