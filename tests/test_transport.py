@@ -278,6 +278,19 @@ def test_every_call_carries_empty_allowed_mentions():
         assert body["allowed_mentions"] == {"parse": []}
 
 
+def test_mention_user_id_pings_only_that_user_on_thread_creation():
+    http = FakeHttp()
+    t = make(http, mention_user_id="42")
+    ref = t.open_thread(title="@everyone hi", card=CARD)
+    t.edit_card(ref, CARD)
+    t.append(ref, content="<@99> @here reply")
+    first = http.calls[0][2]
+    assert first["content"].startswith("<@42> ")
+    assert first["allowed_mentions"] == {"parse": [], "users": ["42"]}
+    for _, _, body in http.calls[1:]:
+        assert body["allowed_mentions"] == {"parse": []}
+
+
 # --- preflight ------------------------------------------------------------
 
 

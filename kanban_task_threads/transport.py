@@ -8,6 +8,8 @@ bot path (ADR-0003) — the capability constants already name them.
 Hard rules from ADR-0007, enforced here so no caller can forget them:
 - `allowed_mentions: {"parse": []}` on every single call. Titles and reasons
   are arbitrary agent output; webhook content parses mentions by default.
+  The only exception is the optional `mention_user_id`, which adds that single
+  user ID to the allowlist on thread creation.
 - Deterministic truncation to Discord's limits before sending.
 """
 
@@ -124,7 +126,9 @@ class DiscordTransport:
         applied_tag_ids: Sequence[str] = (),
         forum_channel_id: str | None = None,
         avatars: AvatarSet | None = None,
+        mention_user_id: str | None = None,
     ):
+        self._mention_user_id = mention_user_id
         self._http = http
         self._webhook_url = webhook_url.rstrip("/")
         self._bot_token = bot_token
@@ -141,13 +145,19 @@ class DiscordTransport:
         return frozenset(caps)
 
     def open_thread(self, *, title: str, card: Card) -> ThreadRef:
+        content, mentions = card.summary, _NO_MENTIONS
+        if self._mention_user_id:
+            # Owner opt-in: ping exactly one configured user on thread creation.
+            # The allowlist keeps any <@...> text in agent output inert.
+            content = truncate(f"<@{self._mention_user_id}> {content}", CONTENT_LIMIT)
+            mentions = {"parse": [], "users": [self._mention_user_id]}
         body = {
             "thread_name": truncate(title, THREAD_TITLE_LIMIT),
             # content: the forum-list preview renders it; embeds show as
             # "Click to see attachment" there
-            "content": card.summary,
+            "content": content,
             "embeds": [self._embed(card)],
-            "allowed_mentions": _NO_MENTIONS,
+            "allowed_mentions": mentions,
         }
         if self._applied_tag_ids:
             body["applied_tags"] = self._applied_tag_ids

@@ -47,6 +47,12 @@ config_schema:
     description: >-
       all preserves legacy provisioning; first_blocked opens one board-qualified
       thread on the first observed durable block and reuses it thereafter.
+  mention_user_id:
+    type: str
+    default: ''
+    description: >-
+      Discord user ID to @mention (and only that user) in the first post of each
+      newly created thread. Empty disables mentions.
   board:
     type: str
     default: ''

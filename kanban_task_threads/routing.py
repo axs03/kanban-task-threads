@@ -337,6 +337,10 @@ def build_multiboard(ctx, logger):
             logger.warning(
                 "kanban-task-threads: invalid avatar settings; continuing without avatars"
             )
+    mention_user_id = ctx.get_config("mention_user_id", "") or None
+    if mention_user_id is not None:
+        mention_user_id = str(mention_user_id)
+        _text(mention_user_id, r"[1-9][0-9]{0,19}")
     verified = []
     for route, paths, (webhook, bot) in zip(routes, files, secrets, strict=True):
         safe_http = _safe_http(
@@ -351,6 +355,7 @@ def build_multiboard(ctx, logger):
             applied_tag_ids=route.tags,
             forum_channel_id=route.forum,
             avatars=avatars,
+            mention_user_id=mention_user_id,
         )
         try:
             info = transport.webhook_info()
